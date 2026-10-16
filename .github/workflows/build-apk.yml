@@ -217,10 +217,11 @@ jobs:
           SHA-256 checksums in SHA256SUMS.txt. See LICENSE.MD and THIRD_PARTY_NOTICES.md before use.
           EOF
 
-          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            gh release upload "${TAG_NAME}" dist/* --clobber
+          if gh release view "${TAG_NAME}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" dist/* --clobber -R "${GITHUB_REPOSITORY}"
           else
             gh release create "${TAG_NAME}" dist/* \
+              -R "${GITHUB_REPOSITORY}" \
               --title "WhiteDNS ${TAG_NAME} (fork)" \
               --notes-file "${NOTES_FILE}" \
               --latest
