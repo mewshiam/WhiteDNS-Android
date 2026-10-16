@@ -1,0 +1,227 @@
+name: Build Signed APKs (Fork)
+
+# Reusable workflow invoked by sync-upstream.yml (after it merges new
+# upstream commits, or with its force_build input) and by the manual
+# "Run workflow" button. Builds the Go DNS engines for 4 ABIs, assembles
+# release APKs (arm64-v8a, armeabi-v7a, x86_64, x86, universal), signs them,
+# and publishes them as a GitHub Release.
+#
+# Required repository secrets (same names as upstream release.yml):
+# - ANDROID_SIGNING_KEYSTORE_BASE64
+# - ANDROID_SIGNING_STORE_PASSWORD
+# - ANDROID_SIGNING_KEY_ALIAS
+# - ANDROID_SIGNING_KEY_PASSWORD
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: WhiteDNS/WhiteDNS-Android
+  ANDROID_API: "26"
+  GRADLE_ANDROID_NDK_VERSION: "26.3.11579264"
+  STORMDNS_ANDROID_NDK_VERSION: "29.0.14206865"
+
+jobs:
+  release:
+    name: Build, sign, and publish fork release APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Fetch upstream tags (for versioning)
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream main --tags --force
+
+      - name: Determine version
+        id: version
+        run: |
+          set -euo pipefail
+          NEAREST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -z "${NEAREST_TAG}" ]; then
+            NEAREST_TAG="$(grep -s '^WHITE_DNS_VERSION_NAME=' gradle.properties | cut -d= -f2 || true)"
+          fi
+          if [ -z "${NEAREST_TAG}" ]; then
+            NEAREST_TAG="1.6.5"
+          fi
+          VERSION_NAME="${NEAREST_TAG#v}"
+          if git tag --points-at HEAD | grep -qx "${NEAREST_TAG}"; then
+            RELEASE_TAG="${VERSION_NAME}"
+          else
+            RELEASE_TAG="${VERSION_NAME}-fork-${GITHUB_RUN_NUMBER}"
+          fi
+          # Monotonic versionCode regardless of which workflow triggered the
+          # build: epoch seconds / 100 (grows over time, fits in an int32).
+          VERSION_CODE=$(( $(date -u +%s) / 100 ))
+          {
+            echo "version_name=${VERSION_NAME}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "version_code=${VERSION_CODE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${RELEASE_TAG} (versionName ${VERSION_NAME}, versionCode ${VERSION_CODE})"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          command -v sdkmanager
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;${GRADLE_ANDROID_NDK_VERSION}" \
+            "ndk;${STORMDNS_ANDROID_NDK_VERSION}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: third_party/StormDNS/go.mod
+          cache-dependency-path: |
+            third_party/StormDNS/go.sum
+            third_party/CottenDns/go.sum
+
+      - name: Report pinned engine commits
+        run: |
+          set -euo pipefail
+          echo "StormDNS  $(git -C third_party/StormDNS rev-parse HEAD)"
+          echo "CottenDns $(git -C third_party/CottenDns rev-parse HEAD)"
+
+      - name: Build DNS native clients
+        run: |
+          set -euo pipefail
+          make stormdns cottendns \
+            NDK_HOST=linux-x86_64 \
+            NDK_ROOT="${ANDROID_HOME}/ndk/${STORMDNS_ANDROID_NDK_VERSION}"
+
+      - name: Verify native core versions
+        run: python3 scripts/verify-cottendns-apks.py --native-only
+
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest
+
+      - name: Build release APKs
+        run: |
+          set -euo pipefail
+          ./gradlew :app:assembleRelease \
+            -PWHITE_DNS_VERSION_NAME="${{ steps.version.outputs.version_name }}" \
+            -PWHITE_DNS_VERSION_CODE="${{ steps.version.outputs.version_code }}"
+
+      - name: Sign release APKs
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for secret_name in \
+            ANDROID_SIGNING_KEYSTORE_BASE64 \
+            ANDROID_SIGNING_STORE_PASSWORD \
+            ANDROID_SIGNING_KEY_ALIAS \
+            ANDROID_SIGNING_KEY_PASSWORD
+          do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "::error::Missing GitHub secret: ${secret_name}"
+              exit 1
+            fi
+          done
+
+          TAG_NAME="${{ steps.version.outputs.release_tag }}"
+          KEYSTORE_PATH="${RUNNER_TEMP}/whitedns-fork-release.keystore"
+          echo "${ANDROID_SIGNING_KEYSTORE_BASE64}" | base64 --decode > "${KEYSTORE_PATH}"
+
+          BUILD_TOOLS_DIR="$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          mkdir -p dist
+
+          shopt -s nullglob
+          unsigned_apks=(app/build/outputs/apk/release/*-release-unsigned.apk)
+          if (( ${#unsigned_apks[@]} == 0 )); then
+            echo "::error::No unsigned release APKs found."
+            exit 1
+          fi
+
+          for unsigned_apk in "${unsigned_apks[@]}"; do
+            base_name="$(basename "${unsigned_apk}" -release-unsigned.apk)"
+            abi_name="${base_name#app-}"
+            if [[ -z "${abi_name}" ]]; then
+              abi_name="universal"
+            fi
+            aligned_apk="${RUNNER_TEMP}/${base_name}-aligned.apk"
+            signed_apk="dist/WhiteDNS-${TAG_NAME}-${abi_name}.apk"
+
+            "${BUILD_TOOLS_DIR}/zipalign" -f -p 4 "${unsigned_apk}" "${aligned_apk}"
+            "${BUILD_TOOLS_DIR}/apksigner" sign \
+              --ks "${KEYSTORE_PATH}" \
+              --ks-pass "pass:${ANDROID_SIGNING_STORE_PASSWORD}" \
+              --ks-key-alias "${ANDROID_SIGNING_KEY_ALIAS}" \
+              --key-pass "pass:${ANDROID_SIGNING_KEY_PASSWORD}" \
+              --out "${signed_apk}" \
+              "${aligned_apk}"
+            "${BUILD_TOOLS_DIR}/apksigner" verify "${signed_apk}"
+          done
+
+          cp THIRD_PARTY_NOTICES.md "dist/WhiteDNS-${TAG_NAME}-THIRD_PARTY_NOTICES.md"
+          (cd dist && shasum -a 256 * > SHA256SUMS.txt)
+
+      - name: Verify packaged CottenDNS cores
+        run: python3 scripts/verify-cottendns-apks.py dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${{ steps.version.outputs.release_tag }}"
+          VERSION_NAME="${{ steps.version.outputs.version_name }}"
+          NOTES_FILE="${RUNNER_TEMP}/release-notes.md"
+
+          cat > "${NOTES_FILE}" <<EOF
+          Automated fork build of WhiteDNS ${VERSION_NAME}.
+
+          Fork of https://github.com/${UPSTREAM_REPO}. These APKs are signed with this fork's own release key, so they only update in place over previous fork builds - not over the official upstream releases.
+
+          | APK | ABI |
+          |---|---|
+          | WhiteDNS-${TAG_NAME}-arm64-v8a.apk | 64-bit ARM (most phones) |
+          | WhiteDNS-${TAG_NAME}-armeabi-v7a.apk | 32-bit ARM |
+          | WhiteDNS-${TAG_NAME}-x86_64.apk | 64-bit x86 (emulators) |
+          | WhiteDNS-${TAG_NAME}-x86.apk | 32-bit x86 |
+          | WhiteDNS-${TAG_NAME}-universal.apk | All ABIs (larger download) |
+
+          SHA-256 checksums in SHA256SUMS.txt. See LICENSE.MD and THIRD_PARTY_NOTICES.md before use.
+          EOF
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" dist/* --clobber
+          else
+            gh release create "${TAG_NAME}" dist/* \
+              --title "WhiteDNS ${TAG_NAME} (fork)" \
+              --notes-file "${NOTES_FILE}" \
+              --latest
+          fi
